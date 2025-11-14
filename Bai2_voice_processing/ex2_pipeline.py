@@ -8,6 +8,9 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+
 
 # ===================== CONFIG ======================
 
@@ -111,27 +114,123 @@ def step3_asr_and_metrics(): # ASR + WER, CER
     print(f"CER = {global_cer:.4f}")
 
 
-# ----------------- STEP 4: GROUP BY DURATION -----------------
-def step4_grouping():
-    short, long = [], []
+# =====================================================
+#                STEP 4 – BUCKETED DATALOADERS (FIXED)
+# =====================================================
 
-    for wav_file in WAV_DIR.glob("*.wav"):
+# =====================================================
+#                STEP 4 – BUCKETED DATALOADERS (NO WARNING)
+# =====================================================
+
+class AudioBucketDataset(Dataset):
+    def __init__(self, data_list, processor):
+        self.data_list = data_list
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        wav_path, transcript = self.data_list[idx]
+
+        # Load audio as numpy array
+        waveform, sr = librosa.load(wav_path, sr=16000)
+
+        return {
+            "waveform": waveform,   # numpy array
+            "transcript": transcript
+        }
+
+
+def create_collate_fn(processor):
+    def collate_fn(batch):
+
+        # 1) List audio arrays
+        waveforms = [item["waveform"] for item in batch]
+        # 2) List transcripts
+        texts = [item["transcript"] for item in batch]
+
+        # ----- AUDIO PROCESSING -----
+        audio_inputs = processor(
+            audio=waveforms,
+            sampling_rate=16000,
+            padding=True,
+            return_tensors="pt"
+        )
+
+        # ----- TEXT PROCESSING (new API: processor(text=...) ) -----
+        text_inputs = processor(
+            text=texts,
+            padding=True,
+            return_tensors="pt"
+        )
+
+        # Replace PAD by -100 for CTC loss
+        labels = text_inputs.input_ids
+        labels = labels.masked_fill(labels == processor.tokenizer.pad_token_id, -100)
+
+        audio_inputs["labels"] = labels
+        return audio_inputs
+
+    return collate_fn
+
+
+def step4_create_dataloaders():
+    print("\n--- Step 4: Creating Bucketed DataLoaders ---")
+
+    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+    test_map = load_test_txt()
+
+    group_short, group_long = [], []
+
+    for wav_file in tqdm(WAV_DIR.glob("*.wav"), desc="Grouping"):
         info = sf.info(str(wav_file))
         dur = info.frames / info.samplerate
-        if dur <= 4.0:
-            short.append(wav_file.name)
-        else:
-            long.append(wav_file.name)
 
-    print("\n=== GROUP RESULT ===")
-    print("Short (<=4s):", len(short))
-    print("Long  (>4s):", len(long))
-    print("Batch Short = 6")
-    print("Batch Long  = 4")
+        fid = wav_file.stem
+        transcript = test_map.get(fid, "").lower().strip()
+
+        if dur <= 4.0:
+            group_short.append((str(wav_file), transcript))
+        else:
+            group_long.append((str(wav_file), transcript))
+
+    print(f"Nhóm ngắn (<=4s): {len(group_short)}")
+    print(f"Nhóm dài  (>4s): {len(group_long)}")
+
+    dataset_short = AudioBucketDataset(group_short, processor)
+    dataset_long = AudioBucketDataset(group_long, processor)
+
+    collate_fn = create_collate_fn(processor)
+
+    loader_short = DataLoader(dataset_short, batch_size=6, shuffle=True, collate_fn=collate_fn)
+    loader_long = DataLoader(dataset_long, batch_size=4, shuffle=True, collate_fn=collate_fn)
+
+    print("\n=== Mechanism Created ===")
+    print(f"→ Batch ngắn = {loader_short.batch_size}")
+    print(f"→ Batch dài  = {loader_long.batch_size}")
+
+    return loader_short, loader_long
+
 
 
 # ----------------- MAIN -----------------
 if __name__ == "__main__":
     step1_get_info_and_convert()
     step3_asr_and_metrics()
-    step4_grouping()
+    
+    loader_short, loader_long = step4_create_dataloaders()
+
+    print("\n--- Demo: Loading 1 batch ---")
+
+    try:
+        b = next(iter(loader_short))
+        print("Short batch OK:", b["input_values"].shape, b["labels"].shape)
+    except Exception as e:
+        print("Short batch ERROR:", e)
+
+    try:
+        b = next(iter(loader_long))
+        print("Long batch OK:", b["input_values"].shape, b["labels"].shape)
+    except Exception as e:
+        print("Long batch ERROR:", e)
